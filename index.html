@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Property CSV Search</title>
+<style>
+ body{font-family:Arial,Helvetica,sans-serif;margin:20px}
+ table{border-collapse:collapse;width:100%;font-size:12px}
+ th,td{border:1px solid #ccc;padding:4px}
+ thead{position:sticky;top:0;background:#f8f8f8}
+ tr:nth-child(even){background:#fafafa}
+ fieldset label{margin-right:14px}
+ #tableContainer{max-height:600px;overflow:auto;margin-top:20px}
+ #rowCount{font-size:13px;color:#666;margin-left:6px}
+ #resultCount{font-size:14px;font-weight:600;margin-top:6px} /* NEW */
+</style>
+</head>
+<body>
+<h2>Upload Property CSV</h2>
+<input type="file" id="csvFile" accept=".csv">
+<span id="rowCount"></span>
+
+<h3>Filters</h3>
+
+<!-- NEW: unified place filter -->
+<label>County, City or ZIP (comma separated): </label>
+<input type="text" id="placeFilter" placeholder="e.g. Orange County, Miami, 90210"><br><br>
+
+<!-- Property–type check-boxes -->
+<fieldset>
+ <legend>Property type</legend>
+ <label><input type="checkbox" class="ptype" value="Vacant Land" checked> Vacant Land</label>
+ <label><input type="checkbox" class="ptype" value="Condo / Studio" checked> Condo / Studio</label>
+ <label><input type="checkbox" class="ptype" value="Single-Family" checked> Single-Family</label>
+ <label><input type="checkbox" class="ptype" value="Small Multi-Family" checked> Small Multi-Family</label>
+ <label><input type="checkbox" class="ptype" value="Large Multi-Family" checked> Large Multi-Family</label>
+ <label><input type="checkbox" class="ptype" value="Unknown" checked> Unknown</label>
+</fieldset><br>
+
+<!-- Distress score range -->
+<label>Distress-score range: </label>
+<input type="number" id="distMin" placeholder="Min" style="width:90px">
+ –
+<input type="number" id="distMax" placeholder="Max" style="width:90px"><br><br>
+
+<button id="applyBtn" disabled>Apply filters</button>
+<button id="downloadBtn" disabled>Download filtered CSV</button>
+
+<div id="resultCount"></div> <!-- NEW -->
+
+<!-- Table area -->
+<div id="tableContainer"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script>
+const MAX_ROWS_INITIAL_RENDER = 5000;
+
+let originalData = [];
+let filteredData = [];
+
+/* ---------- Property-type helper ---------- */
+function derivePropertyType(unit_count_str, sqft_str){
+    let units = parseInt(unit_count_str); if(isNaN(units)) units = 0;
+    let sqft  = parseFloat(sqft_str);     if(isNaN(sqft))  sqft  = 0;
+
+    if ((units===0||units===1)&&sqft===0) return "Vacant Land";
+    if (units<=1 && sqft<800)             return "Condo / Studio";
+    if (units<=1)                         return "Single-Family";
+    if (units>=2 && units<=4)             return "Small Multi-Family";
+    if (units>=5)                         return "Large Multi-Family";
+    return "Unknown";
+}
+
+/* ---------- CSV upload ---------- */
+document.getElementById('csvFile').addEventListener('change', e=>{
+    const file = e.target.files[0]; if(!file) return;
+
+    originalData.length = 0; filteredData.length = 0;
+    tableContainer.innerHTML = '';
+    rowCount.textContent = 'Parsing …';
+    resultCount.textContent = '';          // NEW
+    applyBtn.disabled = true;
+    downloadBtn.disabled = true;
+
+    Papa.parse(file,{
+        header:true, skipEmptyLines:true, worker:true,
+        chunkSize:1024*1024, chunk:onChunk,
+        complete:()=>{
+            rowCount.textContent = `Loaded ${originalData.length.toLocaleString()} rows`;
+            applyBtn.disabled=false;
+        },
+        error: err=>alert('Error parsing CSV: '+err)
+    });
+});
+
+function onChunk(chunk){
+    chunk.data.forEach(r=>{
+        r.property_type = derivePropertyType(r.unit_count, r.living_sqft);
+        originalData.push(r);
+    });
+}
+
+/* ---------- Filtering ---------- */
+applyBtn.addEventListener('click', applyFilters);
+
+function applyFilters(){
+    /* 1. County / City / ZIP ----------------------------------- */
+    const input = placeFilter.value.trim();
+    let placeTokens = null;
+    if(input){
+        placeTokens = input.split(',')
+                           .map(s=>s.trim().toLowerCase())
+                           .filter(Boolean);
+    }
+
+    /* 2. Property type ----------------------------------------- */
+    const checkedTypes = [...document.querySelectorAll('.ptype:checked')]
+                         .map(cb=>cb.value);
+
+    /* 3. Distress range ---------------------------------------- */
+    let minD = distMin.value === '' ? -Infinity : Number(distMin.value);
+    let maxD = distMax.value === '' ?  Infinity : Number(distMax.value);
+
+    /* actual filtering ----------------------------------------- */
+    filteredData = originalData.filter(row=>{
+        /* place match */
+        if(placeTokens){
+            const zip    = (row.zip||'').toString().trim();
+            const city   = (row.city||'').toLowerCase().trim();
+            let county   = (row.county||'').toLowerCase().trim();
+            if(county.endsWith(' county')) county = county.replace(/ county$/,''); // normalize
+
+            const match = placeTokens.some(tok=>{
+                // numeric 5-digit token: treat as ZIP
+                if(/^\d{5}$/.test(tok)) return tok===zip;
+                // otherwise city or county (exact, case-insensitive)
+                return tok===city || tok===county;
+            });
+            if(!match) return false;
+        }
+
+        /* property type */
+        if(!checkedTypes.includes(row.property_type)) return false;
+
+        /* distress */
+        const d = parseFloat(row.distress_score);
+        if(isNaN(d) || d<minD || d>maxD) return false;
+
+        return true;
+    });
+
+    renderTable(filteredData);
+    downloadBtn.disabled = !filteredData.length;
+    /* NEW: show result count */
+    resultCount.textContent = `► ${filteredData.length.toLocaleString()} matching rows`;
+}
+
+/* ---------- Table renderer ---------- */
+function renderTable(data){
+    const container = tableContainer;
+    container.innerHTML = '';
+
+    if(!data.length){
+        container.textContent = 'No rows match current filters.';
+        return;
+    }
+
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const headerRow = document.createElement('tr');
+    Object.keys(data[0]).forEach(key=>{
+        const th=document.createElement('th'); th.textContent=key; headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow); table.appendChild(thead);
+
+    const tbody=document.createElement('tbody');
+    const rowsToRender = data.length>MAX_ROWS_INITIAL_RENDER
+                         ? data.slice(0,MAX_ROWS_INITIAL_RENDER):data;
+
+rowsToRender.forEach(row=>{
+    const tr = document.createElement('tr');
+    for (const key in row) {
+        const td = document.createElement('td');
+
+        /* NEW: make image_url a hyperlink */
+        if (key === 'image_url' && row[key]) {
+            const a = document.createElement('a');
+            a.href   = row[key];
+            a.target = '_blank';
+            a.textContent = 'view';
+            td.appendChild(a);
+        } else {
+            td.textContent = row[key];
+        }
+
+        tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+});
+    table.appendChild(tbody);
+    container.appendChild(table);
+
+    if(data.length>rowsToRender.length){
+        const note=document.createElement('p');
+        note.style.fontSize='12px'; note.style.color='#555';
+        note.textContent=`Showing first ${rowsToRender.length.toLocaleString()} of `
+                        +`${data.length.toLocaleString()} rows. `
+                        +`Download CSV to get the complete set.`;
+        container.appendChild(note);
+    }
+}
+
+/* ---------- Download current view ---------- */
+downloadBtn.addEventListener('click', ()=>{
+    if(!filteredData.length){ alert('Nothing to download.'); return; }
+    const csvText = Papa.unparse(filteredData);
+    const blob=new Blob([csvText],{type:'text/csv;charset=utf-8;'});
+    const url = URL.createObjectURL(blob);
+    const a=document.createElement('a');
+    a.href=url; a.download='filtered_properties.csv';
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
