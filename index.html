@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Property CSV Search</title>
+<title>RERich LeadLens</title>
 <style>
  body{font-family:Arial,Helvetica,sans-serif;margin:20px}
  table{border-collapse:collapse;width:100%;font-size:12px}
@@ -16,7 +16,8 @@
 </style>
 </head>
 <body>
-<h2>Upload Property CSV</h2>
+<h2>Real Estate Rich LeadLens</h2>
+<h3>Upload Property CSV File</h3>
 <input type="file" id="csvFile" accept=".csv">
 <span id="rowCount"></span>
 
@@ -53,7 +54,11 @@
 
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script>
-const MAX_ROWS_INITIAL_RENDER = 5000;
+// Detect phone/tablet
+const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+
+// Cap rows we actually paint
+const MAX_ROWS_INITIAL_RENDER = IS_MOBILE ? 1000 : 5000;
 
 let originalData = [];
 let filteredData = [];
