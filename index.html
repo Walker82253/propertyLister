@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RERich LeadLens</title>
+<title>Property CSV Search & Optimal Route Planner</title>
 <style>
  body{font-family:Arial,Helvetica,sans-serif;margin:20px}
  table{border-collapse:collapse;width:100%;font-size:12px}
@@ -12,219 +12,289 @@
  fieldset label{margin-right:14px}
  #tableContainer{max-height:600px;overflow:auto;margin-top:20px}
  #rowCount{font-size:13px;color:#666;margin-left:6px}
- #resultCount{font-size:14px;font-weight:600;margin-top:6px} /* NEW */
+ #resultCount{font-size:14px;font-weight:600;margin-top:6px}
+ #routeArea{margin:18px 0;font-size:14px}
+ #routeLink{word-break:break-all}
 </style>
 </head>
 <body>
-<h2>Real Estate Rich LeadLens</h2>
-<h3>Upload Property CSV File</h3>
+<h2>Upload Property CSV</h2>
 <input type="file" id="csvFile" accept=".csv">
 <span id="rowCount"></span>
 
 <h3>Filters</h3>
 
-<!-- NEW: unified place filter -->
 <label>County, City or ZIP (comma separated): </label>
 <input type="text" id="placeFilter" placeholder="e.g. Orange County, Miami, 90210"><br><br>
 
-<!-- Property–type check-boxes -->
 <fieldset>
  <legend>Property type</legend>
- <label><input type="checkbox" class="ptype" value="Vacant Land" checked> Vacant Land</label>
- <label><input type="checkbox" class="ptype" value="Condo / Studio" checked> Condo / Studio</label>
- <label><input type="checkbox" class="ptype" value="Single-Family" checked> Single-Family</label>
+ <label><input type="checkbox" class="ptype" value="Vacant Land"      checked> Vacant Land</label>
+ <label><input type="checkbox" class="ptype" value="Condo / Studio"   checked> Condo / Studio</label>
+ <label><input type="checkbox" class="ptype" value="Single-Family"    checked> Single-Family</label>
  <label><input type="checkbox" class="ptype" value="Small Multi-Family" checked> Small Multi-Family</label>
  <label><input type="checkbox" class="ptype" value="Large Multi-Family" checked> Large Multi-Family</label>
- <label><input type="checkbox" class="ptype" value="Unknown" checked> Unknown</label>
+ <label><input type="checkbox" class="ptype" value="Unknown"          checked> Unknown</label>
 </fieldset><br>
 
-<!-- Distress score range -->
 <label>Distress-score range: </label>
-<input type="number" id="distMin" placeholder="Min" style="width:90px">
- –
+<input type="number" id="distMin" placeholder="Min" style="width:90px"> –
 <input type="number" id="distMax" placeholder="Max" style="width:90px"><br><br>
 
-<button id="applyBtn" disabled>Apply filters</button>
+<button id="applyBtn"   disabled>Apply filters</button>
 <button id="downloadBtn" disabled>Download filtered CSV</button>
 
-<div id="resultCount"></div> <!-- NEW -->
+<div id="resultCount"></div>
 
-<!-- Table area -->
+<!-- -------- Route UI -------- -->
+<div id="routeArea">
+  <label>Starting address: </label>
+  <input type="text" id="startAddress" placeholder="123 Main St, City ST">
+  <button id="routeBtn" disabled>Find fastest loop (top 10)</button>
+  <div id="routeLink"></div>
+</div>
+
 <div id="tableContainer"></div>
 
+<!-- libraries -->
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
 <script>
-// Detect phone/tablet
-const IS_MOBILE = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+/* ---------- CONFIG ---------- */
+const WAYPOINT_LIMIT = 10;                                  // # properties
+const IS_MOBILE      = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+const MAX_ROWS_RENDER = IS_MOBILE ? 1000 : 5000;
 
-// Cap rows we actually paint
-const MAX_ROWS_INITIAL_RENDER = IS_MOBILE ? 1000 : 5000;
+/* ---------- STATE ---------- */
+let originalData = [], filteredData = [];
+let dmService = null;               // DistanceMatrixService
+let sdkReady  = false;              // set true by gmapsReady()
 
-let originalData = [];
-let filteredData = [];
-
-/* ---------- Property-type helper ---------- */
-function derivePropertyType(unit_count_str, sqft_str){
-    let units = parseInt(unit_count_str); if(isNaN(units)) units = 0;
-    let sqft  = parseFloat(sqft_str);     if(isNaN(sqft))  sqft  = 0;
-
-    if ((units===0||units===1)&&sqft===0) return "Vacant Land";
-    if (units<=1 && sqft<800)             return "Condo / Studio";
-    if (units<=1)                         return "Single-Family";
-    if (units>=2 && units<=4)             return "Small Multi-Family";
-    if (units>=5)                         return "Large Multi-Family";
-    return "Unknown";
+/* ---------- GOOGLE SDK CALLBACK ---------- */
+function gmapsReady(){
+    dmService = new google.maps.DistanceMatrixService();
+    sdkReady  = true;
 }
 
-/* ---------- CSV upload ---------- */
-document.getElementById('csvFile').addEventListener('change', e=>{
-    const file = e.target.files[0]; if(!file) return;
+/* ---------- HELPERS ---------- */
+function derivePropertyType(u, s){
+  const units = parseInt(u) || 0;
+  const sqft  = parseFloat(s) || 0;
+  if ((units===0||units===1) && sqft===0) return 'Vacant Land';
+  if (units<=1 && sqft<800)               return 'Condo / Studio';
+  if (units<=1)                           return 'Single-Family';
+  if (units>=2 && units<=4)               return 'Small Multi-Family';
+  if (units>=5)                           return 'Large Multi-Family';
+  return 'Unknown';
+}
+const enc = s => encodeURIComponent(s.trim());
 
-    originalData.length = 0; filteredData.length = 0;
-    tableContainer.innerHTML = '';
-    rowCount.textContent = 'Parsing …';
-    resultCount.textContent = '';          // NEW
-    applyBtn.disabled = true;
-    downloadBtn.disabled = true;
+/* ---------- CSV UPLOAD ---------- */
+csvFile.addEventListener('change', e=>{
+  const file = e.target.files[0];
+  if(!file) return;
 
-    Papa.parse(file,{
-        header:true, skipEmptyLines:true, worker:true,
-        chunkSize:1024*1024, chunk:onChunk,
-        complete:()=>{
-            rowCount.textContent = `Loaded ${originalData.length.toLocaleString()} rows`;
-            applyBtn.disabled=false;
-        },
-        error: err=>alert('Error parsing CSV: '+err)
-    });
-});
+  originalData.length = filteredData.length = 0;
+  tableContainer.textContent='';
+  rowCount.textContent='Parsing…';
+  resultCount.textContent='';
+  routeLink.textContent='';
+  applyBtn.disabled  =
+  downloadBtn.disabled =
+  routeBtn.disabled   = true;
 
-function onChunk(chunk){
-    chunk.data.forEach(r=>{
+  Papa.parse(file,{
+    header:true, skipEmptyLines:true, worker:true, chunkSize:1024*1024,
+    chunk: chunk => chunk.data.forEach(r=>{
         r.property_type = derivePropertyType(r.unit_count, r.living_sqft);
         originalData.push(r);
-    });
+    }),
+    complete: ()=>{
+        rowCount.textContent = `Loaded ${originalData.length.toLocaleString()} rows`;
+        applyBtn.disabled = false;
+    },
+    error: err => alert(err)
+  });
+});
+
+/* ---------- FILTERING ---------- */
+applyBtn.addEventListener('click', ()=>{
+  const tokens = placeFilter.value.split(',')
+                 .map(s=>s.trim().toLowerCase()).filter(Boolean);
+  const types  = [...document.querySelectorAll('.ptype:checked')].map(cb=>cb.value);
+  const minD = distMin.value==='' ? -Infinity : +distMin.value;
+  const maxD = distMax.value==='' ?  Infinity : +distMax.value;
+
+  filteredData = originalData.filter(r=>{
+     if(tokens.length){
+        const zip=(r.zip||'').toString().trim();
+        const city=(r.city||'').toLowerCase().trim();
+        let county=(r.county||'').toLowerCase().trim();
+        if(county.endsWith(' county')) county = county.replace(/ county$/,'');
+        if(!tokens.some(t => /^\d{5}$/.test(t) ? t===zip : t===city || t===county))
+            return false;
+     }
+     if(!types.includes(r.property_type)) return false;
+     const d = parseFloat(r.distress_score);
+     if(isNaN(d) || d<minD || d>maxD) return false;
+     return true;
+  });
+
+  renderTable(filteredData);
+  const n = filteredData.length;
+  resultCount.textContent = `► ${n.toLocaleString()} matching rows`;
+  downloadBtn.disabled = !n;
+  routeBtn.disabled    = !n;
+});
+
+/* ---------- ROUTE BUTTON ---------- */
+routeBtn.addEventListener('click', async ()=>{
+  const originTxt = startAddress.value.trim();
+  if(!originTxt){ alert('Enter a starting address.'); return; }
+  if(!filteredData.length){ alert('No filtered rows.'); return; }
+  if(!sdkReady){ alert('Google Maps SDK is still loading. Try again momentarily.'); return; }
+
+  /* take top 10 by distress_score */
+  const rows = [...filteredData].sort((a,b)=>{
+      const x=parseFloat(b.distress_score), y=parseFloat(a.distress_score);
+      return (isNaN(x)?-Infinity:x) - (isNaN(y)?-Infinity:y);
+  }).slice(0, WAYPOINT_LIMIT);
+
+  const props = rows.map(r =>
+      r.full_address ||
+      `${r.address||''}, ${r.city||''}, ${r.state||''} ${r.zip||''}`
+  ).filter(Boolean);
+
+  const all = [originTxt, ...props];            // origin first
+  try{
+      const matrix = await getDistanceMatrix(all); // seconds
+      const order  = tsp(matrix);                  // e.g. [0,3,5,...,0]
+      const orderedStops = order.slice(1, -1);     // indices excluding origin dupes
+
+      const wp  = orderedStops.map(i=>enc(all[i])).join('|');
+      const url = `https://www.google.com/maps/dir/?api=1`
+                + `&origin=${enc(originTxt)}`
+                + `&destination=${enc(originTxt)}`
+                + `&travelmode=driving`
+                + (wp ? `&waypoints=${wp}` : '');
+
+      window.open(url,'_blank');
+      routeLink.innerHTML = `Shareable optimal loop: <a href="${url}" target="_blank">${url}</a>`;
+  }catch(err){
+      console.error(err);
+      alert('Failed to compute route – see console.');
+  }
+});
+
+/* ---------- GOOGLE SDK Distance Matrix ---------- */
+function getDistanceMatrix(addresses){
+  return new Promise((resolve,reject)=>{
+     dmService.getDistanceMatrix({
+        origins:      addresses,
+        destinations: addresses,
+        travelMode:   'DRIVING'
+     }, (res,status)=>{
+        if(status!=='OK'){ reject(status); return; }
+        const n=addresses.length;
+        const M = Array.from({length:n},()=>Array(n).fill(Infinity));
+        res.rows.forEach((row,i)=>{
+           row.elements.forEach((el,j)=>{
+               if(el.status==='OK') M[i][j]=el.duration.value;  // seconds
+           });
+        });
+        resolve(M);
+     });
+  });
 }
 
-/* ---------- Filtering ---------- */
-applyBtn.addEventListener('click', applyFilters);
-
-function applyFilters(){
-    /* 1. County / City / ZIP ----------------------------------- */
-    const input = placeFilter.value.trim();
-    let placeTokens = null;
-    if(input){
-        placeTokens = input.split(',')
-                           .map(s=>s.trim().toLowerCase())
-                           .filter(Boolean);
+/* ---------- Held-Karp exact TSP (n ≤ 11 fast) ---------- */
+function tsp(D){
+  const n=D.length, FULL=(1<<n);
+  const dp=Array.from({length:FULL},()=>Array(n).fill(Infinity));
+  const parent=Array.from({length:FULL},()=>Array(n).fill(-1));
+  dp[1][0]=0;                                     // only origin visited
+  for(let mask=1; mask<FULL; ++mask){
+    for(let u=0; u<n; ++u) if(mask&(1<<u)){
+      const cur=dp[mask][u];
+      if(cur===Infinity) continue;
+      for(let v=1; v<n; ++v) if(!(mask&(1<<v))){
+        const m2=mask|1<<v, alt=cur+D[u][v];
+        if(alt<dp[m2][v]){ dp[m2][v]=alt; parent[m2][v]=u; }
+      }
     }
-
-    /* 2. Property type ----------------------------------------- */
-    const checkedTypes = [...document.querySelectorAll('.ptype:checked')]
-                         .map(cb=>cb.value);
-
-    /* 3. Distress range ---------------------------------------- */
-    let minD = distMin.value === '' ? -Infinity : Number(distMin.value);
-    let maxD = distMax.value === '' ?  Infinity : Number(distMax.value);
-
-    /* actual filtering ----------------------------------------- */
-    filteredData = originalData.filter(row=>{
-        /* place match */
-        if(placeTokens){
-            const zip    = (row.zip||'').toString().trim();
-            const city   = (row.city||'').toLowerCase().trim();
-            let county   = (row.county||'').toLowerCase().trim();
-            if(county.endsWith(' county')) county = county.replace(/ county$/,''); // normalize
-
-            const match = placeTokens.some(tok=>{
-                // numeric 5-digit token: treat as ZIP
-                if(/^\d{5}$/.test(tok)) return tok===zip;
-                // otherwise city or county (exact, case-insensitive)
-                return tok===city || tok===county;
-            });
-            if(!match) return false;
-        }
-
-        /* property type */
-        if(!checkedTypes.includes(row.property_type)) return false;
-
-        /* distress */
-        const d = parseFloat(row.distress_score);
-        if(isNaN(d) || d<minD || d>maxD) return false;
-
-        return true;
-    });
-
-    renderTable(filteredData);
-    downloadBtn.disabled = !filteredData.length;
-    /* NEW: show result count */
-    resultCount.textContent = `► ${filteredData.length.toLocaleString()} matching rows`;
+  }
+  let best=Infinity,last=-1,full=FULL-1;
+  for(let v=1; v<n; ++v){
+    const cost=dp[full][v]+D[v][0];
+    if(cost<best){best=cost; last=v;}
+  }
+  const path=[0]; // reconstruct
+  let mask=full;
+  while(last!==-1){
+    path.push(last);
+    const p=parent[mask][last];
+    mask ^= 1<<last; last=p;
+  }
+  path.push(0);
+  return path;                  // e.g. [0,3,5,2,1,0]
 }
 
-/* ---------- Table renderer ---------- */
+/* ---------- Table Renderer ---------- */
 function renderTable(data){
-    const container = tableContainer;
-    container.innerHTML = '';
+  const container = tableContainer; container.innerHTML='';
+  if(!data.length){ container.textContent='No rows match current filters.'; return; }
 
-    if(!data.length){
-        container.textContent = 'No rows match current filters.';
-        return;
-    }
+  const table=document.createElement('table');
+  const thead=document.createElement('thead');
+  const hr=document.createElement('tr');
+  Object.keys(data[0]).forEach(k=>{
+    const th=document.createElement('th'); th.textContent=k; hr.appendChild(th);
+  });
+  thead.appendChild(hr); table.appendChild(thead);
 
-    const table = document.createElement('table');
-    const thead = document.createElement('thead');
-    const headerRow = document.createElement('tr');
-    Object.keys(data[0]).forEach(key=>{
-        const th=document.createElement('th'); th.textContent=key; headerRow.appendChild(th);
-    });
-    thead.appendChild(headerRow); table.appendChild(thead);
-
-    const tbody=document.createElement('tbody');
-    const rowsToRender = data.length>MAX_ROWS_INITIAL_RENDER
-                         ? data.slice(0,MAX_ROWS_INITIAL_RENDER):data;
-
-rowsToRender.forEach(row=>{
-    const tr = document.createElement('tr');
-    for (const key in row) {
-        const td = document.createElement('td');
-
-        /* NEW: make image_url a hyperlink */
-        if (key === 'image_url' && row[key]) {
-            const a = document.createElement('a');
-            a.href   = row[key];
-            a.target = '_blank';
-            a.textContent = 'view';
-            td.appendChild(a);
-        } else {
-            td.textContent = row[key];
-        }
-
-        tr.appendChild(td);
+  const tbody=document.createElement('tbody');
+  const slice=data.length>MAX_ROWS_RENDER ? data.slice(0,MAX_ROWS_RENDER) : data;
+  slice.forEach(r=>{
+    const tr=document.createElement('tr');
+    for(const k in r){
+      const td=document.createElement('td');
+      if(k==='image_url' && r[k]){
+        const a=document.createElement('a');
+        a.href=r[k]; a.target='_blank'; a.textContent='view';
+        td.appendChild(a);
+      }else td.textContent=r[k];
+      tr.appendChild(td);
     }
     tbody.appendChild(tr);
-});
-    table.appendChild(tbody);
-    container.appendChild(table);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
 
-    if(data.length>rowsToRender.length){
-        const note=document.createElement('p');
-        note.style.fontSize='12px'; note.style.color='#555';
-        note.textContent=`Showing first ${rowsToRender.length.toLocaleString()} of `
-                        +`${data.length.toLocaleString()} rows. `
-                        +`Download CSV to get the complete set.`;
-        container.appendChild(note);
-    }
+  if(data.length>slice.length){
+    const note=document.createElement('p');
+    note.style.cssText='font-size:12px;color:#555';
+    note.textContent=`Showing first ${slice.length.toLocaleString()} of `
+                    +`${data.length.toLocaleString()} rows. Download CSV for the rest.`;
+    container.appendChild(note);
+  }
 }
 
-/* ---------- Download current view ---------- */
+/* ---------- Download CSV ---------- */
 downloadBtn.addEventListener('click', ()=>{
-    if(!filteredData.length){ alert('Nothing to download.'); return; }
-    const csvText = Papa.unparse(filteredData);
-    const blob=new Blob([csvText],{type:'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const a=document.createElement('a');
-    a.href=url; a.download='filtered_properties.csv';
-    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  if(!filteredData.length){ alert('Nothing to download.'); return; }
+  const csv = Papa.unparse(filteredData);
+  const blob = new Blob([csv],{type:'text/csv;charset=utf-8;'});
+  const url  = URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download='filtered_properties.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
 });
+</script>
+
+<!-- Google Maps SDK (after our script so callback finds the function) -->
+<script async
+  src="https://maps.googleapis.com/maps/api/js?key=AIzaSyAu4oeDvoB90NHZiiNiiUTZ8JpUChlWZOY&callback=gmapsReady">
 </script>
 </body>
 </html>
